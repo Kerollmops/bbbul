@@ -1,24 +1,25 @@
 use std::alloc::Layout;
 use std::mem::{self, needs_drop};
 use std::ptr::{self, NonNull};
-use std::slice;
+use std::{marker, slice};
 
 use bitpacking::{BitPacker, BitPacker4x};
 use bumpalo::Bump;
 
 #[derive(Debug)]
-pub struct Bbbul<'bump> {
+pub struct Bbbul<'bump, B> {
     bump: &'bump Bump,
     last: Option<u32>,
     area_len: usize,
-    area: [u32; BitPacker4x::BLOCK_LEN],
+    area: &'bump mut [u32],
     /// We must not have multiple references to the same memory
     /// when one of them is mutable. When reading the list from
-    /// the head we make sure to first drop the &mut Node below.
+    /// the head we make sure to first drop the &mut Nodes below.
     head: Option<NonNull<Node>>,
     /// Here we only keep &mut Node once. We made sure above to
     /// only have a pointer to the head and the next nodes.
     tail: Option<(&'bump mut Node, u32)>,
+    _marker: marker::PhantomData<B>,
 }
 
 #[derive(Debug)]
@@ -37,26 +38,33 @@ impl Node {
         let total_size = Self::BASE_SIZE + block_size;
         let align = mem::align_of::<Option<NonNull<Node>>>();
         let layout = Layout::from_size_align(total_size, align).unwrap();
-        let ptr = bump.alloc_layout(layout).as_ptr();
+        let non_null = bump.alloc_layout(layout);
+
+        /// Constructs a typed fat-pointer from a raw pointer and the allocation size.
+        // https://users.rust-lang.org/t/construct-fat-pointer-to-struct/29198/9
+        unsafe fn fatten(data: NonNull<u8>, len: usize) -> *mut Node {
+            let slice = unsafe { slice::from_raw_parts(data.as_ptr() as *mut (), len) };
+            slice as *const [()] as *mut Node
+        }
 
         unsafe {
             // Init everything to zero and the next pointer too!
-            ptr::write_bytes(ptr, 0, total_size);
-            let slice = slice::from_raw_parts_mut(ptr, total_size);
-            mem::transmute::<&mut [u8], &mut Node>(slice)
+            ptr::write_bytes(non_null.as_ptr(), 0, total_size);
+            &mut *fatten(non_null, block_size)
         }
     }
 }
 
-impl<'bump> Bbbul<'bump> {
-    pub fn new_in(bump: &'bump Bump) -> Bbbul<'bump> {
+impl<'bump, B: BitPacker> Bbbul<'bump, B> {
+    pub fn new_in(bump: &'bump Bump) -> Bbbul<'bump, B> {
         Bbbul {
             bump,
             last: None,
             area_len: 0,
-            area: [0; BitPacker4x::BLOCK_LEN],
+            area: bump.alloc_slice_fill_copy(B::BLOCK_LEN, 0),
             head: None,
             tail: None,
+            _marker: marker::PhantomData,
         }
     }
 
@@ -70,6 +78,7 @@ impl<'bump> Bbbul<'bump> {
 
             if self.area_len == self.area.len() {
                 self.area.sort_unstable();
+
                 // Checking in debug that the working area
                 // does not contain duplicated integers.
                 debug_assert!({
@@ -78,9 +87,10 @@ impl<'bump> Bbbul<'bump> {
                     vec.len() == self.area.len()
                 });
 
-                let last = self.tail.as_ref().map(|(_, l)| *l);
-                let bp = BitPacker4x::new();
-                let bits = bp.num_bits_strictly_sorted(last, &self.area);
+                // Fetch the last compressed number to
+                let initial = self.tail.as_ref().map(|(_, l)| *l);
+                let bp = B::new();
+                let bits = bp.num_bits_strictly_sorted(initial, self.area);
                 let block_size = BitPacker4x::compressed_block_size(bits);
 
                 let node = Node::new_in(block_size, self.bump);
@@ -88,7 +98,10 @@ impl<'bump> Bbbul<'bump> {
                 debug_assert!(node.next.is_none());
 
                 let last_compressed = *self.area.last().unwrap();
-                let size = bp.compress_strictly_sorted(last, &self.area, &mut node.bytes, bits);
+                // TODO we must make sure to always use last = None
+                //      we cannot make sure in Meilisearch that last > decompressed[0]
+                debug_assert!(initial.map_or(true, |n| n < self.area[0]));
+                let size = bp.compress_strictly_sorted(initial, self.area, &mut node.bytes, bits);
                 debug_assert_eq!(node.bytes.len(), size);
 
                 match &mut self.tail {
@@ -106,22 +119,16 @@ impl<'bump> Bbbul<'bump> {
                 }
 
                 self.area_len = 0;
-
-                // I need to push at the end of the list so I need
-                //  - Pointer to optional last maillon of the list
-                //  - Pointer to the optional head
-                //
-                // I need to create a FrozenBbbul that is sync and send (unsafe).
             }
         }
     }
 }
 
-pub struct FrozenBbbul<'a, 'bump>(&'a mut Bbbul<'bump>);
+pub struct FrozenBbbul<'a, 'bump, B>(&'a mut Bbbul<'bump, B>);
 
-impl<'a, 'bump> FrozenBbbul<'a, 'bump> {
+impl<'a, 'bump, B> FrozenBbbul<'a, 'bump, B> {
     /// Creates a `FrozenBbbul` that is `Send` and will never drop, allocate nor deallocate anything.
-    pub fn new(bbbul: &'a mut Bbbul<'bump>) -> FrozenBbbul<'a, 'bump> {
+    pub fn new(bbbul: &'a mut Bbbul<'bump, B>) -> FrozenBbbul<'a, 'bump, B> {
         // We must make sure we do not read nodes while we have still
         // have a mutable reference on one of them. So, we remove the
         // &mut Node in the tail and only keep the head NonNull<Node>.
@@ -142,12 +149,13 @@ impl<'a, 'bump> FrozenBbbul<'a, 'bump> {
     }
 
     /// Gives an iterator of block of integers and clears the `Bbbul` at the same time.
-    pub fn iter_and_clear(&mut self) -> IterAndClear<'_> {
+    pub fn iter_and_clear(&mut self) -> IterAndClear<'_, B> {
         IterAndClear {
             area_len: mem::replace(&mut self.0.area_len, 0),
             area: self.0.area,
             initial: None,
             head: self.0.head.take().map(|nn| unsafe { &*nn.as_ptr() }),
+            _marker: marker::PhantomData,
         }
     }
 }
@@ -158,16 +166,17 @@ impl<'a, 'bump> FrozenBbbul<'a, 'bump> {
 /// - The FrozenBbbul does not leak a shared reference to the allocator.
 ///
 /// So, it is safe to send the contained shared reference to the allocator
-unsafe impl<'a, 'bump> Send for FrozenBbbul<'a, 'bump> {}
+unsafe impl<'a, 'bump, B> Send for FrozenBbbul<'a, 'bump, B> {}
 
-pub struct IterAndClear<'bump> {
+pub struct IterAndClear<'bump, B> {
     area_len: usize,
-    area: [u32; BitPacker4x::BLOCK_LEN],
+    area: &'bump mut [u32],
     initial: Option<u32>,
     head: Option<&'bump Node>,
+    _marker: marker::PhantomData<B>,
 }
 
-impl IterAndClear<'_> {
+impl<B: BitPacker> IterAndClear<'_, B> {
     pub fn next_block(&mut self) -> Option<&[u32]> {
         if self.area_len != 0 {
             let numbers = &self.area[..self.area_len];
@@ -176,18 +185,14 @@ impl IterAndClear<'_> {
         } else if let Some(node) = self.head.take() {
             self.head = node.next.map(|nn| unsafe { &*nn.as_ptr() });
 
-            let bp = BitPacker4x::new();
-            let actual_size = bp.decompress_strictly_sorted(
-                self.initial,
-                &node.bytes,
-                &mut self.area,
-                node.num_bits,
-            );
+            let bp = B::new();
+            let read_bytes =
+                bp.decompress_strictly_sorted(self.initial, &node.bytes, self.area, node.num_bits);
 
-            debug_assert_eq!(actual_size, self.area.len());
+            debug_assert_eq!(read_bytes, node.bytes.len());
             self.initial = self.area.last().copied();
 
-            Some(&self.area)
+            Some(self.area)
         } else {
             None
         }
@@ -195,23 +200,100 @@ impl IterAndClear<'_> {
 }
 
 /// Make sure that Bbbul does not need drop.
-const _BBBUL_NEEDS_DROP: () = if needs_drop::<Bbbul>() {
+const _BBBUL_NEEDS_DROP: () = if needs_drop::<Bbbul<BitPacker4x>>() {
     unreachable!()
 };
 
 /// Make sure that FrozenBbbul does not need drop.
-const _FROZEN_BBBUL_NEEDS_DROP: () = if needs_drop::<FrozenBbbul>() {
+const _FROZEN_BBBUL_NEEDS_DROP: () = if needs_drop::<FrozenBbbul<BitPacker4x>>() {
     unreachable!()
 };
 
 #[cfg(test)]
 mod tests {
-    use std::mem::needs_drop;
+    use std::collections::HashSet;
+
+    use rand::{RngCore, SeedableRng};
 
     use super::*;
 
     #[test]
-    fn does_not_drop() {
-        assert!(!needs_drop::<Bbbul>())
+    fn basic() {
+        let bump = bumpalo::Bump::new();
+        let mut bbbul = Bbbul::<BitPacker4x>::new_in(&bump);
+
+        for n in 0..10000 {
+            bbbul.insert(n);
+        }
+
+        let mut frozen = FrozenBbbul::new(&mut bbbul);
+        let mut iter = frozen.iter_and_clear();
+        let mut expected: HashSet<u32> = (0..10000).collect();
+        while let Some(block) = iter.next_block() {
+            block.iter().for_each(|n| assert!(expected.remove(n)));
+        }
+        assert!(expected.is_empty());
+    }
+
+    #[test]
+    fn basic_reverse() {
+        let bump = bumpalo::Bump::new();
+        let mut bbbul = Bbbul::<BitPacker4x>::new_in(&bump);
+
+        let mut expected = HashSet::new();
+        for n in (0..10000).rev() {
+            expected.insert(n);
+            bbbul.insert(n);
+        }
+
+        let mut frozen = FrozenBbbul::new(&mut bbbul);
+        let mut iter = frozen.iter_and_clear();
+        while let Some(block) = iter.next_block() {
+            block.iter().for_each(|n| assert!(expected.remove(n)));
+        }
+        assert!(expected.is_empty());
+    }
+
+    #[test]
+    fn basic_with_rand() {
+        let bump = bumpalo::Bump::new();
+        let mut bbbul = Bbbul::<BitPacker4x>::new_in(&bump);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
+        let mut expected = HashSet::new();
+        for _ in 0..100000 {
+            let n = rng.next_u32();
+            // Note that it is forbidden to insert the
+            // same number multiple times.
+            if expected.insert(n) {
+                bbbul.insert(n);
+            }
+        }
+
+        let mut frozen = FrozenBbbul::new(&mut bbbul);
+        let mut iter = frozen.iter_and_clear();
+        while let Some(block) = iter.next_block() {
+            block.iter().for_each(|n| assert!(expected.remove(n)));
+        }
+        assert!(expected.is_empty());
+    }
+
+    #[test]
+    fn broken_initial() {
+        let bump = bumpalo::Bump::new();
+        let mut bbbul = Bbbul::<BitPacker4x>::new_in(&bump);
+
+        let mut expected = HashSet::new();
+        for n in (640..768).chain(0..128).chain(300..600) {
+            expected.insert(n);
+            bbbul.insert(n);
+        }
+
+        let mut frozen = FrozenBbbul::new(&mut bbbul);
+        let mut iter = frozen.iter_and_clear();
+        while let Some(block) = iter.next_block() {
+            block.iter().for_each(|n| assert!(expected.remove(n)));
+        }
+        assert!(expected.is_empty());
     }
 }
