@@ -30,8 +30,12 @@ pub struct Bbbul<'bump, B> {
 #[repr(C)]
 struct Node {
     next: Option<NonNull<Node>>,
-    skip_initial: bool,
-    num_bits: u8,
+    /// Note that we use one extra byte to decompress
+    /// the numbers: the num_bits and the skip_initial.
+    ///
+    /// We store this in a extra byte because if we store
+    /// it as a field in this struct the size of it will
+    /// go up to 24 bytes. Now it is 16 bytes (fat pointer).
     bytes: [u8],
 }
 
@@ -40,7 +44,8 @@ impl Node {
 
     #[allow(clippy::mut_from_ref)]
     fn new_in(block_size: usize, bump: &Bump) -> &mut Node {
-        let total_size = Self::BASE_SIZE + block_size;
+        let extra_bytes = block_size + 1;
+        let total_size = Self::BASE_SIZE + extra_bytes;
         let align = mem::align_of::<Option<NonNull<Node>>>();
         let layout = Layout::from_size_align(total_size, align).unwrap();
         let non_null = bump.alloc_layout(layout);
@@ -55,8 +60,36 @@ impl Node {
         unsafe {
             // Init everything to zero and the next pointer too!
             ptr::write_bytes(non_null.as_ptr(), 0, total_size);
-            &mut *fatten(non_null, block_size)
+            &mut *fatten(non_null, extra_bytes)
         }
+    }
+
+    fn set_num_bits(&mut self, num_bits: u8) {
+        self.bytes[0] |= !0b1000_0000 & num_bits
+    }
+
+    fn num_bits(&self) -> u8 {
+        self.bytes[0] & !0b1000_0000
+    }
+
+    fn set_skip_initial(&mut self, yes: bool) {
+        if yes {
+            self.bytes[0] |= 0b1000_0000
+        } else {
+            self.bytes[0] &= !0b1000_0000
+        }
+    }
+
+    fn skip_initial(&self) -> bool {
+        self.bytes[0] & 0b1000_0000 != 0
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[1..]
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[1..]
     }
 }
 
@@ -101,16 +134,19 @@ impl<'bump, B: BitPacker> Bbbul<'bump, B> {
                 let block_size = B::compressed_block_size(bits);
 
                 let node = Node::new_in(block_size, self.bump);
-                node.num_bits = bits;
-                node.skip_initial = initial.is_none();
+                debug_assert_eq!(node.bytes().len(), block_size);
+                node.set_num_bits(bits);
+                debug_assert_eq!(node.num_bits(), bits);
+                node.set_skip_initial(initial.is_none());
+                debug_assert_eq!(node.skip_initial(), initial.is_none());
                 debug_assert!(node.next.is_none());
 
                 // self.skipped_initials += node.skip_initial as usize;
 
                 let new_initial = *self.area.first().unwrap();
                 debug_assert!(initial.map_or(true, |n| n < self.area[0]));
-                let size = bp.compress_strictly_sorted(initial, self.area, &mut node.bytes, bits);
-                debug_assert_eq!(node.bytes.len(), size);
+                let size = bp.compress_strictly_sorted(initial, self.area, node.bytes_mut(), bits);
+                debug_assert_eq!(node.bytes().len(), size);
 
                 match &mut self.tail {
                     Some((tail, initial)) => {
@@ -191,14 +227,15 @@ impl<B: BitPacker> IterAndClear<'_, B> {
             let numbers = &self.area[..self.area_len];
             self.area_len = 0;
             Some(numbers)
-        } else if let Some(Node { next, skip_initial, num_bits, bytes }) = self.head.take() {
-            self.head = next.map(|nn| unsafe { &*nn.as_ptr() });
+        } else if let Some(node) = self.head.take() {
+            self.head = node.next.map(|nn| unsafe { &*nn.as_ptr() });
 
             let bp = B::new();
-            let initial = if *skip_initial { None } else { self.initial };
-            let read_bytes = bp.decompress_strictly_sorted(initial, bytes, self.area, *num_bits);
+            let initial = if node.skip_initial() { None } else { self.initial };
+            let read_bytes =
+                bp.decompress_strictly_sorted(initial, node.bytes(), self.area, node.num_bits());
 
-            debug_assert_eq!(read_bytes, bytes.len());
+            debug_assert_eq!(read_bytes, node.bytes().len());
             self.initial = self.area.first().copied();
 
             Some(self.area)
