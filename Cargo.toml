@@ -1,6 +1,6 @@
 [package]
 name = "bbbul"
-description = "Bumpalo-based bitpacked unsigned list"
+description = "Bumpalo-based bitpacked unsigned-integer list"
 version = "0.1.0"
 edition = "2021"
 
