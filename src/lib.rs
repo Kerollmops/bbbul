@@ -3,7 +3,7 @@ use std::mem::{self, needs_drop};
 use std::ptr::{self, NonNull};
 use std::{marker, slice};
 
-use bitpacking::{BitPacker, BitPacker4x};
+use bitpacking::BitPacker;
 use bumpalo::Bump;
 
 #[derive(Debug)]
@@ -19,6 +19,10 @@ pub struct Bbbul<'bump, B> {
     /// Here we only keep &mut Node once. We made sure above to
     /// only have a pointer to the head and the next nodes.
     tail: Option<(&'bump mut Node, u32)>,
+    // /// The number of times an initial value cannot be used as
+    // /// it is larger than the smallest value of the block being
+    // /// compressed.
+    // skipped_initials: usize,
     _marker: marker::PhantomData<B>,
 }
 
@@ -26,6 +30,7 @@ pub struct Bbbul<'bump, B> {
 #[repr(C)]
 struct Node {
     next: Option<NonNull<Node>>,
+    skip_initial: bool,
     num_bits: u8,
     bytes: [u8],
 }
@@ -64,6 +69,7 @@ impl<'bump, B: BitPacker> Bbbul<'bump, B> {
             area: bump.alloc_slice_fill_copy(B::BLOCK_LEN, 0),
             head: None,
             tail: None,
+            // skipped: 0,
             _marker: marker::PhantomData,
         }
     }
@@ -88,25 +94,27 @@ impl<'bump, B: BitPacker> Bbbul<'bump, B> {
                 });
 
                 // Fetch the last compressed number to
-                let initial = self.tail.as_ref().map(|(_, l)| *l);
+                let initial = self.tail.as_ref().map(|(_, i)| *i).filter(|n| *n < self.area[0]);
+
                 let bp = B::new();
                 let bits = bp.num_bits_strictly_sorted(initial, self.area);
-                let block_size = BitPacker4x::compressed_block_size(bits);
+                let block_size = B::compressed_block_size(bits);
 
                 let node = Node::new_in(block_size, self.bump);
                 node.num_bits = bits;
+                node.skip_initial = initial.is_none();
                 debug_assert!(node.next.is_none());
 
-                let last_compressed = *self.area.last().unwrap();
-                // TODO we must make sure to always use last = None
-                //      we cannot make sure in Meilisearch that last > decompressed[0]
+                // self.skipped_initials += node.skip_initial as usize;
+
+                let new_initial = *self.area.first().unwrap();
                 debug_assert!(initial.map_or(true, |n| n < self.area[0]));
                 let size = bp.compress_strictly_sorted(initial, self.area, &mut node.bytes, bits);
                 debug_assert_eq!(node.bytes.len(), size);
 
                 match &mut self.tail {
-                    Some((tail, last)) => {
-                        *last = last_compressed;
+                    Some((tail, initial)) => {
+                        *initial = new_initial;
                         debug_assert!(tail.next.is_none());
                         tail.next = NonNull::new(node);
                         *tail = node;
@@ -114,7 +122,7 @@ impl<'bump, B: BitPacker> Bbbul<'bump, B> {
                     None => {
                         debug_assert!(self.head.is_none());
                         self.head = NonNull::new(node);
-                        self.tail = Some((node, last_compressed));
+                        self.tail = Some((node, new_initial));
                     }
                 }
 
@@ -133,6 +141,7 @@ impl<'a, 'bump, B> FrozenBbbul<'a, 'bump, B> {
         // have a mutable reference on one of them. So, we remove the
         // &mut Node in the tail and only keep the head NonNull<Node>.
         bbbul.tail = None;
+        // eprintln!("skipped {}", bbbul.skipped_initial);
         FrozenBbbul(bbbul)
     }
 
@@ -182,15 +191,15 @@ impl<B: BitPacker> IterAndClear<'_, B> {
             let numbers = &self.area[..self.area_len];
             self.area_len = 0;
             Some(numbers)
-        } else if let Some(node) = self.head.take() {
-            self.head = node.next.map(|nn| unsafe { &*nn.as_ptr() });
+        } else if let Some(Node { next, skip_initial, num_bits, bytes }) = self.head.take() {
+            self.head = next.map(|nn| unsafe { &*nn.as_ptr() });
 
             let bp = B::new();
-            let read_bytes =
-                bp.decompress_strictly_sorted(self.initial, &node.bytes, self.area, node.num_bits);
+            let initial = if *skip_initial { None } else { self.initial };
+            let read_bytes = bp.decompress_strictly_sorted(initial, bytes, self.area, *num_bits);
 
-            debug_assert_eq!(read_bytes, node.bytes.len());
-            self.initial = self.area.last().copied();
+            debug_assert_eq!(read_bytes, bytes.len());
+            self.initial = self.area.first().copied();
 
             Some(self.area)
         } else {
@@ -200,12 +209,12 @@ impl<B: BitPacker> IterAndClear<'_, B> {
 }
 
 /// Make sure that Bbbul does not need drop.
-const _BBBUL_NEEDS_DROP: () = if needs_drop::<Bbbul<BitPacker4x>>() {
+const _BBBUL_NEEDS_DROP: () = if needs_drop::<Bbbul<bitpacking::BitPacker4x>>() {
     unreachable!()
 };
 
 /// Make sure that FrozenBbbul does not need drop.
-const _FROZEN_BBBUL_NEEDS_DROP: () = if needs_drop::<FrozenBbbul<BitPacker4x>>() {
+const _FROZEN_BBBUL_NEEDS_DROP: () = if needs_drop::<FrozenBbbul<bitpacking::BitPacker4x>>() {
     unreachable!()
 };
 
@@ -213,6 +222,7 @@ const _FROZEN_BBBUL_NEEDS_DROP: () = if needs_drop::<FrozenBbbul<BitPacker4x>>()
 mod tests {
     use std::collections::HashSet;
 
+    use bitpacking::{BitPacker1x, BitPacker4x};
     use rand::{RngCore, SeedableRng};
 
     use super::*;
@@ -238,7 +248,7 @@ mod tests {
     #[test]
     fn basic_reverse() {
         let bump = bumpalo::Bump::new();
-        let mut bbbul = Bbbul::<BitPacker4x>::new_in(&bump);
+        let mut bbbul = Bbbul::<BitPacker1x>::new_in(&bump);
 
         let mut expected = HashSet::new();
         for n in (0..10000).rev() {
